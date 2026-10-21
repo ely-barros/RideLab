@@ -23,17 +23,23 @@ final class BluetoothManager: NSObject, CBCentralManagerDelegate, CBPeripheralDe
     static let cyclingPower = CBUUID(string: "1818")
     static let fitnessMachine = CBUUID(string: "1826")
     static let fitnessServices = [heartRate, cyclingPower, fitnessMachine]
+    
     static let hearRateMeasurement = CBUUID(string: "2A37")
+    static let cyclingPowerMeasurement = CBUUID(string: "2A63")
     
     var devices: [DiscoveredDevice] = []
     var isScanning = false
     var stateText = "Starting..."
+    
+    // Live data, now keyed by role rather than one slot each
     var heartRate: Int?
-    var connectedName: String?
     var contactDetected: Bool?
+    var power: Int?
+    
+    var connectedNames: [UUID: String] = [:] // peripheral id -> display name
     
     @ObservationIgnored private var central: CBCentralManager!
-    @ObservationIgnored private var connectedPeripheral: CBPeripheral?
+    @ObservationIgnored private var peripherals: [UUID: CBPeripheral] = [:] // must hold strong refs
     
     override init() {
         super.init()
@@ -54,15 +60,14 @@ final class BluetoothManager: NSObject, CBCentralManagerDelegate, CBPeripheralDe
     }
     
     func connect(_ device: DiscoveredDevice) {
-        stopScan()
-        connectedPeripheral = device.peripheral
-        connectedName = device.name
+        peripherals[device.id] = device.peripheral
+        connectedNames[device.id] = device.name
         stateText = "Connecting to \(device.name)..."
         central.connect(device.peripheral)
     }
     
-    func disconnect() {
-        if let p = connectedPeripheral {
+    func disconnect(_ id: UUID) {
+        if let p = peripherals[id] {
             central.cancelPeripheralConnection(p)
         }
     }
@@ -86,10 +91,9 @@ final class BluetoothManager: NSObject, CBCentralManagerDelegate, CBPeripheralDe
                         advertisementData: [String: Any],
                         rssi RSSI: NSNumber) {
         let name = peripheral.name
-            ?? advertisementData[CBAdvertisementDataServiceUUIDsKey] as? String
+            ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String
             ?? "Unknown"
         let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
-        
         let device = DiscoveredDevice(id: peripheral.identifier,
                                       peripheral: peripheral,
                                       name: name,
@@ -108,50 +112,57 @@ final class BluetoothManager: NSObject, CBCentralManagerDelegate, CBPeripheralDe
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         stateText = "Connected to \(peripheral.name ?? "device")"
-        peripheral.delegate = self                          // receive peripheral callbacks
-        peripheral.discoverServices([Self.heartRate])       // only ask for what we need
+        peripheral.delegate = self                                             // receive peripheral callbacks
+        peripheral.discoverServices([Self.heartRate, Self.cyclingPower])       // only ask for what we need
     }
     
     func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
         stateText = "Failed to connect: \(error?.localizedDescription ?? "unknown error")"
-        connectedPeripheral = nil
+        peripherals[peripheral.identifier] = nil
+        connectedNames[peripheral.identifier] = nil
     }
     
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
-        stateText = "Disconnected"
-        connectedPeripheral = nil
-        connectedName = nil
-        heartRate = nil
-        contactDetected = nil
+        stateText = "Disconnected from \(peripheral.name ?? "device")"
+        peripherals[peripheral.identifier] = nil
+        connectedNames[peripheral.identifier] = nil
     }
     
     // MARK: - CBPeripheralDelegate
     
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        for service in peripheral.services ?? [] where service.uuid == Self.heartRate {
-            peripheral.discoverCharacteristics([Self.hearRateMeasurement], for: service)
+        for service in peripheral.services ?? [] {
+            if service.uuid == Self.heartRate {
+                peripheral.discoverCharacteristics([Self.hearRateMeasurement], for: service)
+            } else if service.uuid == Self.cyclingPower {
+                peripheral.discoverCharacteristics([Self.cyclingPowerMeasurement], for: service)
+            }
         }
     }
     
     func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
-        for characteristic in service.characteristics ?? []
-        where characteristic.uuid == Self.hearRateMeasurement {
-            peripheral.setNotifyValue(true, for: characteristic)    // subscribe
+        for characteristic in service.characteristics ?? [] {
+            if characteristic.uuid == Self.hearRateMeasurement || characteristic.uuid == Self.cyclingPowerMeasurement {
+                peripheral.setNotifyValue(true, for: characteristic)    // subscribe
+            }
         }
     }
     
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        guard characteristic.uuid == Self.hearRateMeasurement,
-              let data = characteristic.value else { return }
-        parseHeartRate(data)
+        guard let data = characteristic.value else { return }
+        switch characteristic.uuid {
+        case Self.hearRateMeasurement: parseHeartRate(data)
+        case Self.cyclingPowerMeasurement: parsePower(data)
+        default: break
+        }
     }
     
     // MARK: - Parsing
@@ -173,5 +184,14 @@ final class BluetoothManager: NSObject, CBCentralManagerDelegate, CBPeripheralDe
         // Bits 1-2: 0b10 = supported but no contact, 0b11 = contact detected
         let contact = (flags >> 1) & 0b11
         contactDetected = contact == 0b11 ? true : (contact == 0b10 ? false : nil)
+    }
+    
+    private func parsePower(_ data: Data) {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 4 else { return }  // 2 flag bytes + 2 power bytes minimum
+        
+        // Power sits right after the flags, regardless of which optional fields follow
+        let raw = UInt16(bytes[2]) | (UInt16(bytes[3]) << 8)
+        power = Int(Int16(bitPattern: raw)) // reinterpret as signed
     }
 }
